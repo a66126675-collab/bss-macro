@@ -6,7 +6,9 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
@@ -51,12 +53,23 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (prefs.getString("hash", null) != null) showMain()
+    }
+
     private fun text(t: String, size: Float, color: Int) = TextView(this).apply {
         text = t
         textSize = size
         setTextColor(color)
         gravity = Gravity.CENTER
         setPadding(0, 16, 0, 16)
+    }
+
+    private fun openOverlaySettings() {
+        startActivity(
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+        )
     }
 
     private fun showKeyScreen() {
@@ -108,6 +121,7 @@ class MainActivity : Activity() {
                     } else if (typed.isNotEmpty() && sha256(typed) == cfg.optString("key_hash")) {
                         prefs.edit().putString("hash", cfg.optString("key_hash")).apply()
                         showMain()
+                        if (!Settings.canDrawOverlays(this)) openOverlaySettings()
                     } else {
                         status.setTextColor(Color.RED)
                         status.text = "Incorrect key!"
@@ -120,7 +134,24 @@ class MainActivity : Activity() {
     private fun showMain() {
         root.removeAllViews()
         root.addView(text("Key accepted", 24f, Color.parseColor("#4CAF50")))
-        root.addView(text("Next stage: connect Roblox", 16f, Color.LTGRAY))
+
+        if (!Settings.canDrawOverlays(this)) {
+            root.addView(
+                text("Turn on \"Display over other apps\" for BSS Macro, then come back.", 16f, Color.LTGRAY)
+            )
+            val open = Button(this).apply { text = "Open settings" }
+            open.setOnClickListener { openOverlaySettings() }
+            root.addView(open)
+        } else {
+            root.addView(text("Permission granted", 16f, Color.LTGRAY))
+            val start = Button(this).apply { text = "Start floating button" }
+            start.setOnClickListener {
+                val i = Intent(this, FloatingService::class.java)
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                moveTaskToBack(true)
+            }
+            root.addView(start)
+        }
     }
 
     private fun loadConfig(): JSONObject? = try {
