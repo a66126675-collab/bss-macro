@@ -13,14 +13,15 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.Button
 import android.widget.LinearLayout
-import android.widget.TextView
 import kotlin.math.abs
 
 class FloatingService : Service() {
@@ -33,7 +34,7 @@ class FloatingService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startAsForeground()
         if (container == null) addOverlay()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startAsForeground() {
@@ -59,29 +60,71 @@ class FloatingService : Service() {
     private fun addOverlay() {
         val manager = getSystemService(WINDOW_SERVICE) as WindowManager
         wm = manager
-        val dp = resources.displayMetrics.density
 
         val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val cube = CubeView(this)
-        val size = (64 * dp).toInt()
+        val size = dp(64)
         c.addView(cube, LinearLayout.LayoutParams(size, size))
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#EE14161B"))
-            val pad = (12 * dp).toInt()
-            setPadding(pad, pad, pad, pad)
+            background = rounded(Theme.CARD, 16)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             visibility = View.GONE
         }
-        panel.addView(TextView(this).apply {
-            text = "BSS Macro\nMenu: next stage"
-            setTextColor(Color.WHITE)
+        val menu = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val confirm = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
+        menu.addView(label("BSS Macro", 16f, Theme.ACCENT, true))
+        menu.addView(label("Menu: next stage", 13f, Theme.MUTED), params(2))
+        menu.addView(button("Open Roblox", true) {
+            Roblox.open(this, Prefs.get(this, "ps_link"))
+        }, params(10))
+        menu.addView(button("Open app", false) {
+            packageManager.getLaunchIntentForPackage(packageName)?.let {
+                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(it)
+            }
+        }, params(8))
+        menu.addView(button("Close", false) {
+            menu.visibility = View.GONE
+            confirm.visibility = View.VISIBLE
+        }, params(8))
+
+        confirm.addView(label("Are you sure?", 16f, Color.WHITE, true).apply {
+            gravity = Gravity.CENTER
         })
-        panel.addView(Button(this).apply {
-            text = "Close"
-            setOnClickListener { stopSelf() }
-        })
-        c.addView(panel)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(
+            button("Yes", true) {
+                stopSelf()
+                Handler(Looper.getMainLooper()).postDelayed({
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }, 300)
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { rightMargin = dp(6) }
+        )
+        row.addView(
+            button("No", false) {
+                confirm.visibility = View.GONE
+                menu.visibility = View.VISIBLE
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { leftMargin = dp(6) }
+        )
+        confirm.addView(row, params(12))
+
+        panel.addView(menu)
+        panel.addView(confirm)
+        c.addView(
+            panel,
+            LinearLayout.LayoutParams(dp(220), ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8) }
+        )
 
         @Suppress("DEPRECATION")
         val type = if (Build.VERSION.SDK_INT >= 26)
@@ -108,8 +151,10 @@ class FloatingService : Service() {
         cube.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    startX = lp.x; startY = lp.y
-                    touchX = e.rawX; touchY = e.rawY
+                    startX = lp.x
+                    startY = lp.y
+                    touchX = e.rawX
+                    touchY = e.rawY
                     moved = false
                     true
                 }
