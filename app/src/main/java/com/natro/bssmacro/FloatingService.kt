@@ -22,6 +22,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.LinearLayout
+import android.widget.Toast
 import kotlin.math.abs
 
 class FloatingService : Service() {
@@ -78,11 +79,34 @@ class FloatingService : Service() {
             visibility = View.GONE
         }
 
+        val statusTv = label("Status: Idle", 13f, Theme.MUTED)
+        val startBtn = button("Start gather", true) {}
+
+        fun refresh() {
+            startBtn.text = if (MacroService.running) "Stop gather" else "Start gather"
+            statusTv.text = "Status: ${MacroService.status}"
+        }
+
+        startBtn.setOnClickListener {
+            val m = MacroService.instance
+            if (m == null) {
+                Toast.makeText(this, "Enable Accessibility for BSS Macro first", Toast.LENGTH_LONG).show()
+            } else if (MacroService.running) {
+                m.stopGather()
+                startBtn.text = "Start gather"
+            } else {
+                m.startGather()
+                startBtn.text = "Stop gather"
+                panel.visibility = View.GONE
+            }
+        }
+
         menu.addView(label("BSS Macro", 16f, Theme.ACCENT, true))
-        menu.addView(label("Menu: next stage", 13f, Theme.MUTED), params(2))
-        menu.addView(button("Open Roblox", true) {
+        menu.addView(statusTv, params(2))
+        menu.addView(startBtn, params(10))
+        menu.addView(button("Open Roblox", false) {
             Roblox.open(this, Prefs.get(this, "ps_link"))
-        }, params(10))
+        }, params(8))
         menu.addView(button("Open app", false) {
             packageManager.getLaunchIntentForPackage(packageName)?.let {
                 it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -100,10 +124,11 @@ class FloatingService : Service() {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(
             button("Yes", true) {
+                MacroService.instance?.stopGather()
                 stopSelf()
                 Handler(Looper.getMainLooper()).postDelayed({
                     android.os.Process.killProcess(android.os.Process.myPid())
-                }, 300)
+                }, 400)
             },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 .apply { rightMargin = dp(6) }
@@ -171,8 +196,14 @@ class FloatingService : Service() {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!moved) {
-                        panel.visibility =
-                            if (panel.visibility == View.GONE) View.VISIBLE else View.GONE
+                        if (panel.visibility == View.GONE) {
+                            refresh()
+                            confirm.visibility = View.GONE
+                            menu.visibility = View.VISIBLE
+                            panel.visibility = View.VISIBLE
+                        } else {
+                            panel.visibility = View.GONE
+                        }
                     }
                     true
                 }
