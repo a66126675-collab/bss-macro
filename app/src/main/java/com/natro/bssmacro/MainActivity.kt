@@ -201,6 +201,7 @@ class MainActivity : Activity() {
 
     private fun homeTab(b: LinearLayout) {
         val overlayOk = Settings.canDrawOverlays(this)
+        val accOk = MacroService.instance != null
         val robloxOk = Roblox.installed(this)
         b.addView(
             step(
@@ -212,7 +213,16 @@ class MainActivity : Activity() {
         )
         b.addView(
             step(
-                "2. Connect Roblox",
+                "2. Accessibility (taps and swipes)",
+                if (accOk) "Enabled" else "Needed so the macro can control the screen",
+                accOk,
+                if (accOk) null else "Open accessibility settings"
+            ) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) },
+            params(12)
+        )
+        b.addView(
+            step(
+                "3. Connect Roblox",
                 if (robloxOk) "Opens Bee Swarm Simulator automatically."
                 else "Roblox app not found. Install it from Google Play.",
                 false,
@@ -222,8 +232,8 @@ class MainActivity : Activity() {
         )
         b.addView(
             step(
-                "3. Floating button",
-                "Start the draggable cube over Roblox.",
+                "4. Floating button",
+                "Start the cube. In Roblox tap it and press Start gather.",
                 false,
                 "Start floating button"
             ) { startFloating() },
@@ -237,6 +247,11 @@ class MainActivity : Activity() {
 
         fun num(key: String, hintText: String) =
             input(hintText, Prefs.get(this, key), numeric = true) { Prefs.put(this, key, it) }
+
+        fun cal(key: String, def: Int) =
+            input(def.toString(), Prefs.get(this, key).ifEmpty { def.toString() }, numeric = true) {
+                Prefs.put(this, key, it)
+            }
 
         b.addView(
             card(
@@ -258,7 +273,25 @@ class MainActivity : Activity() {
             )
         )
         b.addView(
-            card(label("The auto-gather engine is the next stage. These settings are saved now.", 13f, Theme.MUTED)),
+            card(
+                label("Calibration (% of screen)", 17f, Color.WHITE, true),
+                label("Where the macro touches the screen in landscape. Adjust if it misses.", 13f, Theme.MUTED),
+                field("Joystick start X", cal("joy_x", 14)),
+                field("Joystick start Y", cal("joy_y", 70)),
+                field("Joystick push distance", cal("joy_r", 12)),
+                field("Tool hold X", cal("hold_x", 65)),
+                field("Tool hold Y", cal("hold_y", 40))
+            ),
+            params(12)
+        )
+        b.addView(
+            card(
+                label(
+                    "Return to hive at pack % needs screen reading and comes later. " +
+                        "For now gathering stops after the minutes you set.",
+                    13f, Theme.MUTED
+                )
+            ),
             params(12)
         )
     }
@@ -370,6 +403,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("Are you sure?")
             .setPositiveButton("Yes") { _, _ ->
+                MacroService.instance?.stopGather()
                 stopService(Intent(this, FloatingService::class.java))
                 finishAndRemoveTask()
             }
