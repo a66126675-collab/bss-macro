@@ -1,0 +1,146 @@
+package com.natro.bssmacro
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import kotlin.math.max
+import kotlin.math.min
+
+class CaptureService : Service() {
+
+    companion object {
+        @Volatile var active = false
+        @Volatile var capW = 0
+        @Volatile var capH = 0
+        @Volatile private var reader: ImageReader? = null
+        @Volatile private var last: IntArray? = null
+
+        /** Latest frame as ARGB ints (capW * capH). Returns the previous frame if the screen did not change. */
+        fun grab(): IntArray? {
+            val r = reader ?: return last
+            val img = try {
+                r.acquireLatestImage()
+            } catch (e: Exception) {
+                null
+            } ?: return last
+            try {
+                val plane = img.planes[0]
+                val rowPixels = plane.rowStride / plane.pixelStride
+                val bmp = Bitmap.createBitmap(rowPixels, capH, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(plane.buffer)
+                val out = IntArray(capW * capH)
+                bmp.getPixels(out, 0, capW, 0, 0, capW, capH)
+                bmp.recycle()
+                last = out
+                return out
+            } catch (e: Exception) {
+                return last
+            } finally {
+                img.close()
+            }
+        }
+    }
+
+    private var projection: MediaProjection? = null
+    private var display: VirtualDisplay? = null
+    private var closed = false
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    @Suppress("DEPRECATION")
+    private fun readData(i: Intent?): Intent? =
+        if (Build.VERSION.SDK_INT >= 33) i?.getParcelableExtra("data", Intent::class.java)
+        else i?.getParcelableExtra<Intent>("data")
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val code = intent?.getIntExtra("code", 0) ?: 0
+        val data = readData(intent)
+        if (data == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startAsForeground()
+        try {
+            begin(code, data)
+        } catch (e: Exception) {
+            MacroService.status = "Capture error: ${e.message}"
+            shutdown()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun startAsForeground() {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(
+                NotificationChannel("macro", "BSS Macro", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "macro")
+        else Notification.Builder(this)
+        val n = b.setContentTitle("BSS Macro")
+            .setContentText("Screen sharing is on")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(2, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(2, n)
+        }
+    }
+
+    private fun begin(code: Int, data: Intent) {
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mp = mpm.getMediaProjection(code, data)
+        projection = mp
+        mp.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                shutdown()
+            }
+        }, Handler(Looper.getMainLooper()))
+
+        val dm = resources.displayMetrics
+        val big = max(dm.widthPixels, dm.heightPixels)
+        val small = min(dm.widthPixels, dm.heightPixels)
+        capW = big / 4
+        capH = small / 4
+        val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2)
+        reader = r
+        display = mp.createVirtualDisplay(
+            "bss-capture", capW, capH, dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
+        )
+        active = true
+    }
+
+    private fun shutdown() {
+        if (closed) return
+        closed = true
+        active = false
+        try { display?.release() } catch (e: Exception) {}
+        try { reader?.close() } catch (e: Exception) {}
+        reader = null
+        last = null
+        try { projection?.stop() } catch (e: Exception) {}
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        shutdown()
+        super.onDestroy()
+    }
+}
