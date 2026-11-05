@@ -70,14 +70,16 @@ class CaptureService : Service() {
         val code = intent?.getIntExtra("code", 0) ?: 0
         val data = readData(intent)
         if (data == null) {
+            MacroService.status = "Capture error: no permission data"
             stopSelf()
             return START_NOT_STICKY
         }
-        startAsForeground()
         try {
+            startAsForeground()
             begin(code, data)
+            MacroService.status = "Screen sharing on"
         } catch (e: Exception) {
-            MacroService.status = "Capture error: ${e.message}"
+            MacroService.status = "Capture error: ${e.javaClass.simpleName} ${e.message}"
             shutdown()
         }
         return START_NOT_STICKY
