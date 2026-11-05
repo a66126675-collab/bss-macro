@@ -1,0 +1,3 @@
+<resources>
+    <string name="macro_desc">BSS Macro uses this service only to perform taps and swipes in the game when you press Start gather. It does not read texts, passwords or messages and sends nothing anywhere.</string>
+</resources>
