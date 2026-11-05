@@ -8,7 +8,6 @@
     </queries>
     <application
         android:label="BSS Macro"
-        android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".MainActivity"
@@ -26,6 +25,18 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="floating_overlay_button"/>
+        </service>
+        <service
+            android:name=".MacroService"
+            android:exported="true"
+            android:label="BSS Macro"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/macro_service"/>
         </service>
     </application>
 </manifest>
