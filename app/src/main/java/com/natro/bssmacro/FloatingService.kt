@@ -84,7 +84,8 @@ class FloatingService : Service() {
 
         fun refresh() {
             startBtn.text = if (MacroService.running) "Stop gather" else "Start gather"
-            statusTv.text = "Status: ${MacroService.status}"
+            statusTv.text = "Status: ${MacroService.status}  |  Screen: " +
+                if (CaptureService.active) "on" else "off"
         }
 
         startBtn.setOnClickListener {
@@ -104,6 +105,12 @@ class FloatingService : Service() {
         menu.addView(label("BSS Macro", 16f, Theme.ACCENT, true))
         menu.addView(statusTv, params(2))
         menu.addView(startBtn, params(10))
+        menu.addView(button("Share screen", false) {
+            val i = Intent(this, CaptureRequestActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+            panel.visibility = View.GONE
+        }, params(8))
         menu.addView(button("Open Roblox", false) {
             Roblox.open(this, Prefs.get(this, "ps_link"))
         }, params(8))
@@ -125,6 +132,7 @@ class FloatingService : Service() {
         row.addView(
             button("Yes", true) {
                 MacroService.instance?.stopGather()
+                stopService(Intent(this, CaptureService::class.java))
                 stopSelf()
                 Handler(Looper.getMainLooper()).postDelayed({
                     android.os.Process.killProcess(android.os.Process.myPid())
