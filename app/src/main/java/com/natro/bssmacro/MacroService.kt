@@ -37,6 +37,8 @@ class MacroService : AccessibilityService() {
     private var holdY = 0f
     private var prevFrame: IntArray? = null
     private var movingAvg = 12f
+    private var lastDiff = 0f
+    private var cancels = 0
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
@@ -125,21 +127,30 @@ class MacroService : AccessibilityService() {
         return l
     }
 
+    private fun refreshStatus() {
+        status = "Gathering | screen " +
+            (if (CaptureService.active) "on, diff " + String.format("%.1f", lastDiff) else "off") +
+            " | cancels " + cancels
+    }
+
     private fun loop() {
         var failed = false
         try {
             Thread.sleep(2000)
+            cancels = 0
             val mins = num(this, "mins", 20).coerceAtLeast(1)
-            val unit = when (Prefs.get(this, "length")) {
+            val base = when (Prefs.get(this, "length")) {
                 "Short" -> 600
                 "Long" -> 1500
                 else -> 1000
             }
+            // With screen sharing the macro walks until the wall, so legs can be longer
+            val unit = if (CaptureService.active) base * 2 else base
             val widthN = Prefs.get(this, "width").toIntOrNull() ?: 3
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
-            status = "Gathering"
             movingAvg = 12f
+            refreshStatus()
             while (running && SystemClock.elapsedRealtime() < end) {
                 for ((dx, dy, u) in legs) {
                     if (!running || SystemClock.elapsedRealtime() >= end) break
@@ -235,57 +246,67 @@ class MacroService : AccessibilityService() {
         b1.addStroke(h)
         if (!send(b1.build())) return false
 
-        // Hold in short chunks; if the screen stops moving, the character is stuck at a wall
         val rest = (ms - 80L).coerceAtLeast(50L)
+
+        // No screen sharing: one long hold, like the first version
+        if (!CaptureService.active) {
+            refreshStatus()
+            return holdChunk(rest, cx, cy, ex, ey, hx, hy, moving)
+        }
+
+        // Screen sharing: hold in 0.5 s chunks and stop the leg when the picture freezes (wall)
         var elapsed = 0L
-        var stuckHits = 0
+        var stuck = 0
         prevFrame = null
         while (elapsed < rest && running) {
-            val chunk = (rest - elapsed).coerceIn(50L, 300L)
-            if (!holdChunk(chunk)) return false
+            val chunk = (rest - elapsed).coerceIn(50L, 500L)
+            if (!holdChunk(chunk, cx, cy, ex, ey, hx, hy, moving)) return false
             elapsed += chunk
-            if (moving && CaptureService.active) {
+            if (moving) {
                 val d = frameDiff()
                 if (d != null) {
-                    status = "Gathering (diff " + String.format("%.1f", d) + ")"
-                    if (elapsed >= 600) {
-                        if (d < 8f && d < movingAvg * 0.35f) {
-                            stuckHits++
-                        } else {
-                            stuckHits = 0
-                            if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
-                        }
-                        if (stuckHits >= 2) break
+                    lastDiff = d
+                    if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
+                    if (elapsed >= 1000L) {
+                        if (d < 3f && d < movingAvg * 0.3f) stuck++ else stuck = 0
+                        if (stuck >= 2) break
                     }
                 }
             }
+            refreshStatus()
         }
         return true
     }
 
-    private fun holdChunk(ms: Long): Boolean {
+    /** Holds the joystick and the tool for [ms]. If a finger was lost, it is pressed again. */
+    private fun holdChunk(
+        ms: Long, cx: Float, cy: Float, ex: Float, ey: Float,
+        hx: Float, hy: Float, moving: Boolean
+    ): Boolean {
         val b = GestureDescription.Builder()
-        var count = 0
-        joy?.let { j ->
+        if (moving) {
+            val pj = joy
             val p = Path()
-            p.moveTo(joyX, joyY)
-            val nj = j.continueStroke(p, 0L, ms, true)
-            joy = nj
-            b.addStroke(nj)
-            count++
+            val j = if (pj != null) {
+                p.moveTo(joyX, joyY)
+                pj.continueStroke(p, 0L, ms, true)
+            } else {
+                p.moveTo(cx, cy)
+                p.lineTo(ex, ey)
+                joyX = ex
+                joyY = ey
+                StrokeDescription(p, 0L, ms, true)
+            }
+            joy = j
+            b.addStroke(j)
         }
-        hold?.let { h2 ->
-            val p = Path()
-            p.moveTo(holdX, holdY)
-            val nh = h2.continueStroke(p, 0L, ms, true)
-            hold = nh
-            b.addStroke(nh)
-            count++
-        }
-        if (count == 0) {
-            Thread.sleep(ms)
-            return true
-        }
+        val ph = hold
+        val hp = Path()
+        hp.moveTo(hx, hy)
+        val h = if (ph != null) ph.continueStroke(hp, 0L, ms, true)
+        else StrokeDescription(hp, 0L, ms, true)
+        hold = h
+        b.addStroke(h)
         return send(b.build())
     }
 
@@ -337,6 +358,7 @@ class MacroService : AccessibilityService() {
             if ((abortable && !running) || ++waits > 600) break
         }
         if (!completed && running) {
+            cancels++
             joy = null
             hold = null
         }
