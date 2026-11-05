@@ -13,6 +13,7 @@ import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -34,6 +35,8 @@ class MacroService : AccessibilityService() {
     private var joyY = 0f
     private var holdX = 0f
     private var holdY = 0f
+    private var prevFrame: IntArray? = null
+    private var movingAvg = 12f
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
@@ -136,6 +139,7 @@ class MacroService : AccessibilityService() {
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
             status = "Gathering"
+            movingAvg = 12f
             while (running && SystemClock.elapsedRealtime() < end) {
                 for ((dx, dy, u) in legs) {
                     if (!running || SystemClock.elapsedRealtime() >= end) break
@@ -155,6 +159,37 @@ class MacroService : AccessibilityService() {
             release()
             running = false
         }
+    }
+
+    /** Average color change between two frames in the middle of the screen (0..255). */
+    private fun frameDiff(): Float? {
+        val f = CaptureService.grab() ?: return null
+        val w = CaptureService.capW
+        val h = CaptureService.capH
+        val p = prevFrame
+        prevFrame = f
+        if (p == null || p.size != f.size) return null
+        var sum = 0L
+        var cnt = 0
+        val x0 = w * 25 / 100
+        val x1 = w * 90 / 100
+        val y0 = h * 10 / 100
+        val y1 = h * 75 / 100
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val a = f[y * w + x]
+                val b = p[y * w + x]
+                sum += abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
+                    abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
+                    abs((a and 255) - (b and 255))
+                cnt++
+                x += 3
+            }
+            y += 3
+        }
+        return if (cnt == 0) null else sum.toFloat() / (cnt * 3)
     }
 
     private fun step(dx: Float, dy: Float, ms: Long): Boolean {
@@ -200,31 +235,58 @@ class MacroService : AccessibilityService() {
         b1.addStroke(h)
         if (!send(b1.build())) return false
 
-        // Gesture 2: hold position for the rest of the leg
+        // Hold in short chunks; if the screen stops moving, the character is stuck at a wall
         val rest = (ms - 80L).coerceAtLeast(50L)
-        val b2 = GestureDescription.Builder()
+        var elapsed = 0L
+        var stuckHits = 0
+        prevFrame = null
+        while (elapsed < rest && running) {
+            val chunk = (rest - elapsed).coerceIn(50L, 300L)
+            if (!holdChunk(chunk)) return false
+            elapsed += chunk
+            if (moving && CaptureService.active) {
+                val d = frameDiff()
+                if (d != null) {
+                    status = "Gathering (diff " + String.format("%.1f", d) + ")"
+                    if (elapsed >= 600) {
+                        if (d < 8f && d < movingAvg * 0.35f) {
+                            stuckHits++
+                        } else {
+                            stuckHits = 0
+                            if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
+                        }
+                        if (stuckHits >= 2) break
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    private fun holdChunk(ms: Long): Boolean {
+        val b = GestureDescription.Builder()
         var count = 0
         joy?.let { j ->
             val p = Path()
             p.moveTo(joyX, joyY)
-            val nj = j.continueStroke(p, 0L, rest, true)
+            val nj = j.continueStroke(p, 0L, ms, true)
             joy = nj
-            b2.addStroke(nj)
+            b.addStroke(nj)
             count++
         }
         hold?.let { h2 ->
             val p = Path()
             p.moveTo(holdX, holdY)
-            val nh = h2.continueStroke(p, 0L, rest, true)
+            val nh = h2.continueStroke(p, 0L, ms, true)
             hold = nh
-            b2.addStroke(nh)
+            b.addStroke(nh)
             count++
         }
         if (count == 0) {
-            Thread.sleep(rest)
+            Thread.sleep(ms)
             return true
         }
-        return send(b2.build())
+        return send(b.build())
     }
 
     private fun release() {
@@ -245,6 +307,7 @@ class MacroService : AccessibilityService() {
             }
             joy = null
             hold = null
+            prevFrame = null
             if (any) send(b.build(), false)
         } catch (e: Exception) {
             joy = null
