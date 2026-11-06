@@ -6,7 +6,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -27,28 +26,35 @@ class CaptureService : Service() {
         @Volatile var capW = 0
         @Volatile var capH = 0
         @Volatile private var reader: ImageReader? = null
-        @Volatile private var last: IntArray? = null
 
-        /** Latest frame as ARGB ints (capW * capH). Returns the previous frame if the screen did not change. */
+        /** New frame as RGB ints (capW * capH), or null if there is no new frame yet. */
         fun grab(): IntArray? {
-            val r = reader ?: return last
+            val r = reader ?: return null
             val img = try {
                 r.acquireLatestImage()
             } catch (e: Exception) {
                 null
-            } ?: return last
+            } ?: return null
             try {
                 val plane = img.planes[0]
-                val rowPixels = plane.rowStride / plane.pixelStride
-                val bmp = Bitmap.createBitmap(rowPixels, capH, Bitmap.Config.ARGB_8888)
-                bmp.copyPixelsFromBuffer(plane.buffer)
-                val out = IntArray(capW * capH)
-                bmp.getPixels(out, 0, capW, 0, 0, capW, capH)
-                bmp.recycle()
-                last = out
+                val buf = plane.buffer
+                val rowStride = plane.rowStride
+                val pix = plane.pixelStride
+                val w = capW
+                val h = capH
+                val out = IntArray(w * h)
+                for (y in 0 until h) {
+                    for (x in 0 until w) {
+                        val o = y * rowStride + x * pix
+                        val rr = buf.get(o).toInt() and 255
+                        val gg = buf.get(o + 1).toInt() and 255
+                        val bb = buf.get(o + 2).toInt() and 255
+                        out[y * w + x] = (rr shl 16) or (gg shl 8) or bb
+                    }
+                }
                 return out
             } catch (e: Exception) {
-                return last
+                return null
             } finally {
                 img.close()
             }
@@ -136,7 +142,6 @@ class CaptureService : Service() {
         try { display?.release() } catch (e: Exception) {}
         try { reader?.close() } catch (e: Exception) {}
         reader = null
-        last = null
         try { projection?.stop() } catch (e: Exception) {}
         stopSelf()
     }
