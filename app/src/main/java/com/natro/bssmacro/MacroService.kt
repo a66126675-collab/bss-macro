@@ -41,8 +41,8 @@ class MacroService : AccessibilityService() {
     private var holdX = 0f
     private var holdY = 0f
     private var prevFrame: IntArray? = null
-    private var movingAvg = -1f
     private var lastDiff = 0f
+    private var lastLimit = 0f
     private var cancels = 0
     private var walls = 0
     private val handler = Handler(Looper.getMainLooper())
@@ -133,9 +133,13 @@ class MacroService : AccessibilityService() {
         return l
     }
 
+    private fun f1(x: Float): String = String.format("%.1f", x)
+
     private fun refreshStatus() {
         status = "Gathering | screen " +
-            (if (CaptureService.active) "on, diff " + String.format("%.1f", lastDiff) + ", walls " + walls else "off") +
+            (if (CaptureService.active)
+                "on, diff " + f1(lastDiff) + "/" + f1(lastLimit) + ", walls " + walls
+            else "off") +
             " | cancels " + cancels
     }
 
@@ -145,18 +149,19 @@ class MacroService : AccessibilityService() {
             Thread.sleep(2000)
             cancels = 0
             walls = 0
+            lastDiff = 0f
+            lastLimit = 0f
             val mins = num(this, "mins", 20).coerceAtLeast(1)
             val base = when (Prefs.get(this, "length")) {
                 "Short" -> 600
                 "Long" -> 1500
                 else -> 1000
             }
-            // With screen sharing legs are longer: the macro stops at the wall by itself
-            val unit = if (CaptureService.active) base * 2 else base
+            // With screen sharing legs are longer: the macro turns at the wall by itself
+            val unit = if (CaptureService.active) base * 3 / 2 else base
             val widthN = Prefs.get(this, "width").toIntOrNull() ?: 3
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
-            movingAvg = -1f
             refreshStatus()
             while (running && SystemClock.elapsedRealtime() < end) {
                 for ((dx, dy, u) in legs) {
@@ -179,9 +184,13 @@ class MacroService : AccessibilityService() {
         }
     }
 
-    /** Average color change between two frames in the middle of the screen (0..255), or null. */
+    /**
+     * Average color change since the previous check in the middle of the screen (0..255).
+     * No new frame means the picture did not change at all (0). Null only before the first frame.
+     */
     private fun frameDiff(): Float? {
-        val f = CaptureService.grab() ?: return null
+        val f = CaptureService.grab()
+        if (f == null) return if (prevFrame != null) 0f else null
         val w = CaptureService.capW
         val h = CaptureService.capH
         val p = prevFrame
@@ -262,32 +271,40 @@ class MacroService : AccessibilityService() {
         }
         val g = buildHold(rest, hx, hy, moving) ?: return true
 
-        // No screen sharing: one long hold
+        // No screen sharing (or standing still): one long hold
         if (!CaptureService.active || !moving) {
             refreshStatus()
             return send(g)
         }
 
-        // Screen sharing: long hold, but watch the picture and stop at the wall
+        // Screen sharing: long hold, but watch the picture and turn at the wall.
+        // First 1.5 s of every leg teach how much the picture changes while walking.
         val pend = sendAsync(g) ?: return false
         val t0 = SystemClock.elapsedRealtime()
+        val learn = mutableListOf<Float>()
+        var baseline = -1f
         var stuck = 0
         prevFrame = null
         while (running && !pend.latch.await(300, TimeUnit.MILLISECONDS)) {
             val d = frameDiff() ?: continue
             lastDiff = d
-            if (movingAvg < 0f) {
-                movingAvg = d
-                continue
-            }
-            if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
-            if (SystemClock.elapsedRealtime() - t0 >= 1200L) {
-                if (d < movingAvg * 0.35f) stuck++ else stuck = 0
-                if (stuck >= 2) {
-                    walls++
-                    cancelInFlight(cx, cy)
-                    refreshStatus()
-                    return true
+            val t = SystemClock.elapsedRealtime() - t0
+            if (t < 1500L) {
+                learn.add(d)
+            } else {
+                if (baseline < 0f) {
+                    val s = learn.sorted()
+                    baseline = if (s.isEmpty()) d else s[s.size * 3 / 4]
+                }
+                lastLimit = baseline * 0.4f
+                if (baseline >= 3f) {
+                    if (d < lastLimit) stuck++ else stuck = 0
+                    if (stuck >= 2) {
+                        walls++
+                        cancelInFlight(cx, cy)
+                        refreshStatus()
+                        return true
+                    }
                 }
             }
             refreshStatus()
@@ -320,7 +337,7 @@ class MacroService : AccessibilityService() {
         return b.build()
     }
 
-    /** A tiny tap in an empty area cancels the running long gesture and lifts all fingers. */
+    /** A tiny tap cancels the running long gesture and lifts all fingers. */
     private fun cancelInFlight(x: Float, y: Float) {
         val p = Path()
         p.moveTo(x, y)
