@@ -30,6 +30,17 @@ class MacroService : AccessibilityService() {
 
         fun num(ctx: Context, key: String, def: Int): Int =
             Prefs.get(ctx, key).toIntOrNull() ?: def
+
+        /** Milliseconds from the field center to its edge (Length + manual adjustment). */
+        fun halfMs(ctx: Context): Int {
+            val base = when (Prefs.get(ctx, "length")) {
+                "Short" -> 500
+                "Long" -> 1200
+                else -> 800
+            }
+            val adj = Prefs.get(ctx, "half_adj").toIntOrNull() ?: 0
+            return max(100, base + adj)
+        }
     }
 
     private class Pending {
@@ -46,6 +57,7 @@ class MacroService : AccessibilityService() {
     private var prevFrame: IntArray? = null
     private var lastMove = 0f
     private var lastLimit = 0f
+    private var visionWeak = false
     private var cancels = 0
     private var walls = 0
     private val handler = Handler(Looper.getMainLooper())
@@ -80,6 +92,46 @@ class MacroService : AccessibilityService() {
 
     fun stopGather() {
         running = false
+    }
+
+    /** Shows what screen sharing really sees: frames, brightness and how much the picture changes. */
+    fun testCapture() {
+        if (running) return
+        if (!CaptureService.active) {
+            status = "Test: screen sharing is off"
+            return
+        }
+        status = "Testing screen for 3 s..."
+        Thread {
+            var frames = 0
+            var bright = 0f
+            var move = 0f
+            var moveN = 0
+            var prev: IntArray? = null
+            for (i in 0 until 10) {
+                Thread.sleep(300)
+                val f = CaptureService.grab() ?: continue
+                frames++
+                var s = 0L
+                var c = 0
+                var k = 0
+                while (k < f.size) {
+                    val v = f[k]
+                    s += ((v shr 16) and 255) + ((v shr 8) and 255) + (v and 255)
+                    c += 3
+                    k += 37
+                }
+                bright = if (c > 0) s.toFloat() / c else 0f
+                val p = prev
+                if (p != null && p.size == f.size) {
+                    move += fraction(f, p)
+                    moveN++
+                }
+                prev = f
+            }
+            status = "Test: frames $frames/10, brightness ${bright.toInt()}, change " +
+                (if (moveN > 0) pct(move / moveN) else "n/a")
+        }.start()
     }
 
     private fun screen(): Pair<Float, Float> {
@@ -176,7 +228,8 @@ class MacroService : AccessibilityService() {
     private fun refreshStatus() {
         status = "Gathering | screen " +
             (if (CaptureService.active)
-                "on, move " + pct(lastMove) + "/lim " + pct(lastLimit) + ", walls " + walls
+                "on, move " + pct(lastMove) + "/lim " + pct(lastLimit) + ", walls " + walls +
+                    (if (visionWeak) ", vision weak" else "")
             else "off") +
             " | cancels " + cancels
     }
@@ -189,13 +242,9 @@ class MacroService : AccessibilityService() {
             walls = 0
             lastMove = 0f
             lastLimit = 0f
+            visionWeak = false
             val mins = num(this, "mins", 20).coerceAtLeast(1)
-            // Milliseconds from the field center to its edge
-            val unit = when (Prefs.get(this, "length")) {
-                "Short" -> 500
-                "Long" -> 1200
-                else -> 800
-            }
+            val unit = halfMs(this)
             val widthN = (Prefs.get(this, "width").toIntOrNull() ?: 3).coerceIn(1, 5)
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
@@ -221,19 +270,10 @@ class MacroService : AccessibilityService() {
         }
     }
 
-    /**
-     * Share of sampled points (left and right of the character, not the center with bees)
-     * whose color changed since the previous check. 0 if the screen sent no new frame.
-     * Null only before the very first frame.
-     */
-    private fun moveFraction(): Float? {
-        val f = CaptureService.grab()
-        if (f == null) return if (prevFrame != null) 0f else null
+    /** Share of sampled points (left and right of the character) whose color changed noticeably. */
+    private fun fraction(f: IntArray, p: IntArray): Float {
         val w = CaptureService.capW
         val h = CaptureService.capH
-        val p = prevFrame
-        prevFrame = f
-        if (p == null || p.size != f.size) return null
         var changed = 0
         var cnt = 0
         val y0 = h * 15 / 100
@@ -250,7 +290,7 @@ class MacroService : AccessibilityService() {
                     val d = abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
                         abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
                         abs((a and 255) - (b and 255))
-                    if (d > 60) changed++
+                    if (d > 30) changed++
                     cnt++
                     x += 2
                 }
@@ -258,7 +298,17 @@ class MacroService : AccessibilityService() {
             }
             region += 2
         }
-        return if (cnt == 0) null else changed.toFloat() / cnt
+        return if (cnt == 0) 0f else changed.toFloat() / cnt
+    }
+
+    /** 0 if the screen sent no new frame; null only before the very first frame. */
+    private fun moveFraction(): Float? {
+        val f = CaptureService.grab()
+        if (f == null) return if (prevFrame != null) 0f else null
+        val p = prevFrame
+        prevFrame = f
+        if (p == null || p.size != f.size) return null
+        return fraction(f, p)
     }
 
     private fun step(dx: Float, dy: Float, ms: Long): Boolean {
@@ -320,7 +370,7 @@ class MacroService : AccessibilityService() {
         }
 
         // Screen sharing: long hold, but watch the picture and turn at the wall.
-        // The first 1.5 s of every leg teach how much the picture changes while walking.
+        // The first 1.2 s of every leg teach how much the picture changes while walking.
         val pend = sendAsync(g) ?: return false
         val t0 = SystemClock.elapsedRealtime()
         val learn = mutableListOf<Float>()
@@ -331,15 +381,16 @@ class MacroService : AccessibilityService() {
             val d = moveFraction() ?: continue
             lastMove = d
             val t = SystemClock.elapsedRealtime() - t0
-            if (t < 1500L) {
+            if (t < 1200L) {
                 learn.add(d)
             } else {
                 if (baseline < 0f) {
                     val s = learn.sorted()
                     baseline = if (s.isEmpty()) 0f else s[s.size * 3 / 4]
+                    visionWeak = baseline < 0.02f
                 }
-                lastLimit = baseline * 0.25f
-                if (baseline >= 0.06f) {
+                lastLimit = baseline * 0.3f
+                if (!visionWeak) {
                     if (d < lastLimit) stuck++ else stuck = 0
                     if (stuck >= 2) {
                         walls++
