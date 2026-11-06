@@ -29,6 +29,11 @@ class MacroService : AccessibilityService() {
             Prefs.get(ctx, key).toIntOrNull() ?: def
     }
 
+    private class Pending {
+        val latch = CountDownLatch(1)
+        @Volatile var completed = false
+    }
+
     private var joy: StrokeDescription? = null
     private var hold: StrokeDescription? = null
     private var joyX = 0f
@@ -36,9 +41,10 @@ class MacroService : AccessibilityService() {
     private var holdX = 0f
     private var holdY = 0f
     private var prevFrame: IntArray? = null
-    private var movingAvg = 12f
+    private var movingAvg = -1f
     private var lastDiff = 0f
     private var cancels = 0
+    private var walls = 0
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
@@ -129,7 +135,7 @@ class MacroService : AccessibilityService() {
 
     private fun refreshStatus() {
         status = "Gathering | screen " +
-            (if (CaptureService.active) "on, diff " + String.format("%.1f", lastDiff) else "off") +
+            (if (CaptureService.active) "on, diff " + String.format("%.1f", lastDiff) + ", walls " + walls else "off") +
             " | cancels " + cancels
     }
 
@@ -138,18 +144,19 @@ class MacroService : AccessibilityService() {
         try {
             Thread.sleep(2000)
             cancels = 0
+            walls = 0
             val mins = num(this, "mins", 20).coerceAtLeast(1)
             val base = when (Prefs.get(this, "length")) {
                 "Short" -> 600
                 "Long" -> 1500
                 else -> 1000
             }
-            // With screen sharing the macro walks until the wall, so legs can be longer
+            // With screen sharing legs are longer: the macro stops at the wall by itself
             val unit = if (CaptureService.active) base * 2 else base
             val widthN = Prefs.get(this, "width").toIntOrNull() ?: 3
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
-            movingAvg = 12f
+            movingAvg = -1f
             refreshStatus()
             while (running && SystemClock.elapsedRealtime() < end) {
                 for ((dx, dy, u) in legs) {
@@ -172,7 +179,7 @@ class MacroService : AccessibilityService() {
         }
     }
 
-    /** Average color change between two frames in the middle of the screen (0..255). */
+    /** Average color change between two frames in the middle of the screen (0..255), or null. */
     private fun frameDiff(): Float? {
         val f = CaptureService.grab() ?: return null
         val w = CaptureService.capW
@@ -248,66 +255,81 @@ class MacroService : AccessibilityService() {
 
         val rest = (ms - 80L).coerceAtLeast(50L)
 
-        // No screen sharing: one long hold, like the first version
-        if (!CaptureService.active) {
+        // A finger was lost (gesture cancelled): the next leg starts from scratch
+        if ((moving && joy == null) || hold == null) {
+            Thread.sleep(100)
+            return true
+        }
+        val g = buildHold(rest, hx, hy, moving) ?: return true
+
+        // No screen sharing: one long hold
+        if (!CaptureService.active || !moving) {
             refreshStatus()
-            return holdChunk(rest, cx, cy, ex, ey, hx, hy, moving)
+            return send(g)
         }
 
-        // Screen sharing: hold in 0.5 s chunks and stop the leg when the picture freezes (wall)
-        var elapsed = 0L
+        // Screen sharing: long hold, but watch the picture and stop at the wall
+        val pend = sendAsync(g) ?: return false
+        val t0 = SystemClock.elapsedRealtime()
         var stuck = 0
         prevFrame = null
-        while (elapsed < rest && running) {
-            val chunk = (rest - elapsed).coerceIn(50L, 500L)
-            if (!holdChunk(chunk, cx, cy, ex, ey, hx, hy, moving)) return false
-            elapsed += chunk
-            if (moving) {
-                val d = frameDiff()
-                if (d != null) {
-                    lastDiff = d
-                    if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
-                    if (elapsed >= 1000L) {
-                        if (d < 3f && d < movingAvg * 0.3f) stuck++ else stuck = 0
-                        if (stuck >= 2) break
-                    }
+        while (running && !pend.latch.await(300, TimeUnit.MILLISECONDS)) {
+            val d = frameDiff() ?: continue
+            lastDiff = d
+            if (movingAvg < 0f) {
+                movingAvg = d
+                continue
+            }
+            if (d > movingAvg * 0.5f) movingAvg = movingAvg * 0.8f + d * 0.2f
+            if (SystemClock.elapsedRealtime() - t0 >= 1200L) {
+                if (d < movingAvg * 0.35f) stuck++ else stuck = 0
+                if (stuck >= 2) {
+                    walls++
+                    cancelInFlight(cx, cy)
+                    refreshStatus()
+                    return true
                 }
             }
             refreshStatus()
         }
+        if (!pend.completed && running) {
+            cancels++
+            joy = null
+            hold = null
+        }
         return true
     }
 
-    /** Holds the joystick and the tool for [ms]. If a finger was lost, it is pressed again. */
-    private fun holdChunk(
-        ms: Long, cx: Float, cy: Float, ex: Float, ey: Float,
-        hx: Float, hy: Float, moving: Boolean
-    ): Boolean {
+    /** One long gesture that keeps the joystick and the tool finger pressed for [ms]. */
+    private fun buildHold(ms: Long, hx: Float, hy: Float, moving: Boolean): GestureDescription? {
         val b = GestureDescription.Builder()
         if (moving) {
-            val pj = joy
+            val pj = joy ?: return null
             val p = Path()
-            val j = if (pj != null) {
-                p.moveTo(joyX, joyY)
-                pj.continueStroke(p, 0L, ms, true)
-            } else {
-                p.moveTo(cx, cy)
-                p.lineTo(ex, ey)
-                joyX = ex
-                joyY = ey
-                StrokeDescription(p, 0L, ms, true)
-            }
+            p.moveTo(joyX, joyY)
+            val j = pj.continueStroke(p, 0L, ms, true)
             joy = j
             b.addStroke(j)
         }
-        val ph = hold
+        val ph = hold ?: return null
         val hp = Path()
         hp.moveTo(hx, hy)
-        val h = if (ph != null) ph.continueStroke(hp, 0L, ms, true)
-        else StrokeDescription(hp, 0L, ms, true)
+        val h = ph.continueStroke(hp, 0L, ms, true)
         hold = h
         b.addStroke(h)
-        return send(b.build())
+        return b.build()
+    }
+
+    /** A tiny tap in an empty area cancels the running long gesture and lifts all fingers. */
+    private fun cancelInFlight(x: Float, y: Float) {
+        val p = Path()
+        p.moveTo(x, y)
+        val g = GestureDescription.Builder()
+            .addStroke(StrokeDescription(p, 0L, 10L, false))
+            .build()
+        joy = null
+        hold = null
+        send(g, false)
     }
 
     private fun release() {
@@ -336,28 +358,32 @@ class MacroService : AccessibilityService() {
         }
     }
 
-    private fun send(g: GestureDescription, abortable: Boolean = true): Boolean {
-        val latch = CountDownLatch(1)
-        var completed = false
+    private fun sendAsync(g: GestureDescription): Pending? {
+        val pend = Pending()
         val cb = object : AccessibilityService.GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
-                completed = true
-                latch.countDown()
+                pend.completed = true
+                pend.latch.countDown()
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
-                latch.countDown()
+                pend.latch.countDown()
             }
         }
         if (!dispatchGesture(g, cb, handler)) {
             status = "Gesture rejected"
-            return false
+            return null
         }
+        return pend
+    }
+
+    private fun send(g: GestureDescription, abortable: Boolean = true): Boolean {
+        val pend = sendAsync(g) ?: return false
         var waits = 0
-        while (!latch.await(50, TimeUnit.MILLISECONDS)) {
+        while (!pend.latch.await(50, TimeUnit.MILLISECONDS)) {
             if ((abortable && !running) || ++waits > 600) break
         }
-        if (!completed && running) {
+        if (!pend.completed && running) {
             cancels++
             joy = null
             hold = null
