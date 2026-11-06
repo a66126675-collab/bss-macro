@@ -13,9 +13,12 @@ import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 class MacroService : AccessibilityService() {
@@ -41,7 +44,7 @@ class MacroService : AccessibilityService() {
     private var holdX = 0f
     private var holdY = 0f
     private var prevFrame: IntArray? = null
-    private var lastDiff = 0f
+    private var lastMove = 0f
     private var lastLimit = 0f
     private var cancels = 0
     private var walls = 0
@@ -87,58 +90,93 @@ class MacroService : AccessibilityService() {
         )
     }
 
+    /**
+     * Patterns are built around the field center (0,0) and always return to it.
+     * Coordinates are in "half-field" units: 1.0 = from the center to the field edge.
+     * Each leg is (dirX, dirY, length in half-field units).
+     */
     private fun legs(pattern: String, w: Int): List<Triple<Float, Float, Float>> {
-        val l = mutableListOf<Triple<Float, Float, Float>>()
+        val pts = mutableListOf<Pair<Float, Float>>()
         when (pattern) {
-            "Lines", "Snake" -> {
-                repeat(w) {
-                    l.add(Triple(0f, -1f, 2f))
-                    l.add(Triple(1f, 0f, 0.5f))
-                    l.add(Triple(0f, 1f, 2f))
-                    l.add(Triple(1f, 0f, 0.5f))
+            "Lines" -> {
+                val s = 1.6f / w
+                for (k in 0 until w) {
+                    val x = (k - (w - 1) / 2f) * s
+                    if (k % 2 == 0) {
+                        pts.add(Pair(x, -1f))
+                        pts.add(Pair(x, 1f))
+                    } else {
+                        pts.add(Pair(x, 1f))
+                        pts.add(Pair(x, -1f))
+                    }
                 }
-                l.add(Triple(-1f, 0f, w.toFloat()))
+            }
+            "Snake" -> {
+                val s = 1.6f / w
+                for (k in 0 until w) {
+                    val y = (k - (w - 1) / 2f) * s
+                    if (k % 2 == 0) {
+                        pts.add(Pair(-1f, y))
+                        pts.add(Pair(1f, y))
+                    } else {
+                        pts.add(Pair(1f, y))
+                        pts.add(Pair(-1f, y))
+                    }
+                }
             }
             "Squares" -> {
                 for (i in 1..w) {
-                    val s = i * 0.6f
-                    l.add(Triple(0f, -1f, s))
-                    l.add(Triple(1f, 0f, s))
-                    l.add(Triple(0f, 1f, s))
-                    l.add(Triple(-1f, 0f, s))
+                    val q = i.toFloat() / w * 0.9f
+                    pts.add(Pair(-q, -q))
+                    pts.add(Pair(q, -q))
+                    pts.add(Pair(q, q))
+                    pts.add(Pair(-q, q))
+                    pts.add(Pair(-q, -q))
                 }
             }
             "Spiral" -> {
-                val dirs = listOf(
-                    Pair(1f, 0f), Pair(0f, -1f), Pair(-1f, 0f), Pair(0f, 1f)
-                )
-                for (k in 0 until 4 * w) {
-                    val d = dirs[k % 4]
-                    l.add(Triple(d.first, d.second, (k / 2 + 1) * 0.5f))
+                val n = w * 8
+                for (k in 1..n) {
+                    val a = k * (PI / 4.0)
+                    val r = k.toFloat() / n * 0.9f
+                    pts.add(Pair((r * cos(a)).toFloat(), (r * sin(a)).toFloat()))
                 }
-                val back = l.reversed().map { Triple(-it.first, -it.second, it.third) }
-                l.addAll(back)
+                val back = pts.reversed()
+                pts.addAll(back)
             }
             "Diamonds" -> {
                 for (i in 1..w) {
-                    val s = i * 0.5f
-                    l.add(Triple(1f, -1f, s))
-                    l.add(Triple(1f, 1f, s))
-                    l.add(Triple(-1f, 1f, s))
-                    l.add(Triple(-1f, -1f, s))
+                    val q = i.toFloat() / w * 0.9f
+                    pts.add(Pair(0f, -q))
+                    pts.add(Pair(q, 0f))
+                    pts.add(Pair(0f, q))
+                    pts.add(Pair(-q, 0f))
+                    pts.add(Pair(0f, -q))
                 }
             }
-            else -> l.add(Triple(0f, 0f, 5f))
+        }
+        if (pts.isEmpty()) return listOf(Triple(0f, 0f, 5f))
+        pts.add(Pair(0f, 0f))
+        val l = mutableListOf<Triple<Float, Float, Float>>()
+        var cx = 0f
+        var cy = 0f
+        for (p in pts) {
+            val dx = p.first - cx
+            val dy = p.second - cy
+            val d = sqrt(dx * dx + dy * dy)
+            if (d > 0.02f) l.add(Triple(dx / d, dy / d, d))
+            cx = p.first
+            cy = p.second
         }
         return l
     }
 
-    private fun f1(x: Float): String = String.format("%.1f", x)
+    private fun pct(x: Float): String = String.format("%.0f", x * 100f) + "%"
 
     private fun refreshStatus() {
         status = "Gathering | screen " +
             (if (CaptureService.active)
-                "on, diff " + f1(lastDiff) + "/" + f1(lastLimit) + ", walls " + walls
+                "on, move " + pct(lastMove) + "/lim " + pct(lastLimit) + ", walls " + walls
             else "off") +
             " | cancels " + cancels
     }
@@ -149,17 +187,16 @@ class MacroService : AccessibilityService() {
             Thread.sleep(2000)
             cancels = 0
             walls = 0
-            lastDiff = 0f
+            lastMove = 0f
             lastLimit = 0f
             val mins = num(this, "mins", 20).coerceAtLeast(1)
-            val base = when (Prefs.get(this, "length")) {
-                "Short" -> 600
-                "Long" -> 1500
-                else -> 1000
+            // Milliseconds from the field center to its edge
+            val unit = when (Prefs.get(this, "length")) {
+                "Short" -> 500
+                "Long" -> 1200
+                else -> 800
             }
-            // With screen sharing legs are longer: the macro turns at the wall by itself
-            val unit = if (CaptureService.active) base * 3 / 2 else base
-            val widthN = Prefs.get(this, "width").toIntOrNull() ?: 3
+            val widthN = (Prefs.get(this, "width").toIntOrNull() ?: 3).coerceIn(1, 5)
             val legs = legs(Prefs.get(this, "pattern"), widthN)
             val end = SystemClock.elapsedRealtime() + mins * 60_000L
             refreshStatus()
@@ -185,10 +222,11 @@ class MacroService : AccessibilityService() {
     }
 
     /**
-     * Average color change since the previous check in the middle of the screen (0..255).
-     * No new frame means the picture did not change at all (0). Null only before the first frame.
+     * Share of sampled points (left and right of the character, not the center with bees)
+     * whose color changed since the previous check. 0 if the screen sent no new frame.
+     * Null only before the very first frame.
      */
-    private fun frameDiff(): Float? {
+    private fun moveFraction(): Float? {
         val f = CaptureService.grab()
         if (f == null) return if (prevFrame != null) 0f else null
         val w = CaptureService.capW
@@ -196,27 +234,31 @@ class MacroService : AccessibilityService() {
         val p = prevFrame
         prevFrame = f
         if (p == null || p.size != f.size) return null
-        var sum = 0L
+        var changed = 0
         var cnt = 0
-        val x0 = w * 25 / 100
-        val x1 = w * 90 / 100
-        val y0 = h * 10 / 100
-        val y1 = h * 75 / 100
-        var y = y0
-        while (y < y1) {
-            var x = x0
-            while (x < x1) {
-                val a = f[y * w + x]
-                val b = p[y * w + x]
-                sum += abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
-                    abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
-                    abs((a and 255) - (b and 255))
-                cnt++
-                x += 3
+        val y0 = h * 15 / 100
+        val y1 = h * 70 / 100
+        val xs = intArrayOf(w * 22 / 100, w * 38 / 100, w * 70 / 100, w * 92 / 100)
+        var region = 0
+        while (region < 4) {
+            var y = y0
+            while (y < y1) {
+                var x = xs[region]
+                while (x < xs[region + 1]) {
+                    val a = f[y * w + x]
+                    val b = p[y * w + x]
+                    val d = abs(((a shr 16) and 255) - ((b shr 16) and 255)) +
+                        abs(((a shr 8) and 255) - ((b shr 8) and 255)) +
+                        abs((a and 255) - (b and 255))
+                    if (d > 60) changed++
+                    cnt++
+                    x += 2
+                }
+                y += 2
             }
-            y += 3
+            region += 2
         }
-        return if (cnt == 0) null else sum.toFloat() / (cnt * 3)
+        return if (cnt == 0) null else changed.toFloat() / cnt
     }
 
     private fun step(dx: Float, dy: Float, ms: Long): Boolean {
@@ -278,7 +320,7 @@ class MacroService : AccessibilityService() {
         }
 
         // Screen sharing: long hold, but watch the picture and turn at the wall.
-        // First 1.5 s of every leg teach how much the picture changes while walking.
+        // The first 1.5 s of every leg teach how much the picture changes while walking.
         val pend = sendAsync(g) ?: return false
         val t0 = SystemClock.elapsedRealtime()
         val learn = mutableListOf<Float>()
@@ -286,18 +328,18 @@ class MacroService : AccessibilityService() {
         var stuck = 0
         prevFrame = null
         while (running && !pend.latch.await(300, TimeUnit.MILLISECONDS)) {
-            val d = frameDiff() ?: continue
-            lastDiff = d
+            val d = moveFraction() ?: continue
+            lastMove = d
             val t = SystemClock.elapsedRealtime() - t0
             if (t < 1500L) {
                 learn.add(d)
             } else {
                 if (baseline < 0f) {
                     val s = learn.sorted()
-                    baseline = if (s.isEmpty()) d else s[s.size * 3 / 4]
+                    baseline = if (s.isEmpty()) 0f else s[s.size * 3 / 4]
                 }
-                lastLimit = baseline * 0.4f
-                if (baseline >= 3f) {
+                lastLimit = baseline * 0.25f
+                if (baseline >= 0.06f) {
                     if (d < lastLimit) stuck++ else stuck = 0
                     if (stuck >= 2) {
                         walls++
